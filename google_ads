@@ -1,834 +1,262 @@
-{% assign dimensions = vars.google_ads.models.google__ad_report.dimensions %}
-{% assign active_dimensions = dimensions | where: 'active', true %}
-{% assign dimensions = dimensions | where: 'default', true | concat: active_dimensions  %}
-{% assign metrics = vars.google_ads.models.google__ad_report.metrics %}
-{% assign active_metrics = metrics | where: 'active', true %}
-{% assign metrics = metrics | where: 'default', true | concat: active_metrics  %}
-{% assign account_id = vars.google_ads.account_ids %}
-{% assign active = vars.google_ads.active %}
-{% assign table_active = vars.google_ads.models.google__ad_report.active %}
-{% assign dataset_id = vars.output_dataset_id %}
-{% assign table_id = vars.google_ads.models.google__ad_report.table_id %}
-{% assign source_dataset_id = vars.google_ads.source_dataset_id %}
-{% assign conversions = vars.google_ads.conversions %}
-{% assign number_of_accounts = vars.google_ads.account_ids | size %}
-{% assign regexp_filters = vars.google_ads.regexp_filters %}
-{% assign micro_denominator = 1000000 %}
-{% assign source_table_id = 'ad_report' %}
-{% assign ad_group_delimiter = vars.google_ads.delimiters.ad_group %}
-{% assign campaign_delimiter = vars.google_ads.delimiters.campaign %}
+{% assign dataset_id = vars.platform.google_ads.dataset_id %}
+{% assign account_ids = vars.platform.google_ads.account_ids %}
+{% assign active = true %}
 
-{% if source_dataset_id contains 'fivetran' %}
-    CREATE OR REPLACE TABLE 
-        `{{dataset_id}}`.`{{table_id}}` (
-        {% for dimension in dimensions %}
-            {% unless forloop.first %}
-                , 
-            {% endunless %}
-            `{{dimension.name}}` {{dimension.type}} OPTIONS (description = '[db_field_name = {{dimension.name}}]') 
-        {% endfor %}
-        {% for metric in metrics %}
-            , `{{metric.name}}` {{metric.type}}  OPTIONS (description = '[db_field_name = {{metric.name}}]') 
-        {% endfor %}
-        )
-    {% if active and table_active %}
-        AS(
-            with 
-
-            sync_info as (
-                select
-                  max(datetime(_fivetran_synced, "{{ vars.timezone }}")) as max_synced_at
-                  , max(date) as max_data_date
-                from {{source_dataset_id}}.{{source_table_id}}
-            )
-
-            , campaigns as(
-                select
-                    *
-                from
-                    {{source_dataset_id}}.campaign_history
-                qualify rank() over(partition by id order by updated_at desc) = 1
-                and row_number() over(partition by id, updated_at) = 1
-            )
-
-            , accounts as(
-                select
-                    *
-                from
-                    {{source_dataset_id}}.account_history
-                qualify rank() over(partition by id order by updated_at desc) = 1
-                and row_number() over(partition by id, updated_at) = 1      
-            )
-
-            , ad_groups as(
-                select
-                    *
-                from
-                    {{source_dataset_id}}.ad_group_history
-                qualify rank() over(partition by id order by updated_at desc) = 1
-                and row_number() over(partition by id, updated_at) = 1 
-            )
-
-            , ads as(
-                select
-                    *
-                from
-                    {{source_dataset_id}}.ad_history
-                qualify rank() over(partition by id, ad_group_id order by updated_at desc) = 1
-                and row_number() over(partition by id, ad_group_id, updated_at) = 1 
-            )
-
-            , latest as(
-                select
-                    *
-                from
-                {{source_dataset_id}}.responsive_search_ad_history
-                qualify rank() over(partition by ad_id, ad_group_id order by updated_at desc) = 1
-                and row_number() over(partition by ad_id, ad_group_id, updated_at) = 1
-            )
-
-            , headlines as(
-                select
-                    ad_id
-                    , ad_group_id
-                    , json_value(element, "$.text") as headline
-                    , headlines
-                from
-                    latest
-                    , unnest(json_extract_array(headlines)) as element
-                group by
-                    1,2,3,4
-                qualify row_number() over(partition by ad_group_id, ad_id) <= 3
-            )
-
-            , descriptions as(
-                select
-                    ad_id
-                    , ad_group_id
-                    , json_value(element, "$.text") as description
-                    , descriptions
-                from
-                    latest
-                    , unnest(json_extract_array(descriptions)) as element
-                group by
-                    1,2,3,4
-                qualify row_number() over(partition by ad_group_id, ad_id) <= 2
-            )
-
-            , headlines_added as(
-                select
-                    latest.ad_id
-                    , latest.ad_group_id
-                    , string_agg(headlines.headline, " | " order by headline) as headline
-                from
-                    latest
-                left join
-                    headlines
-                on
-                    latest.ad_id = headlines.ad_id
-                and
-                    latest.ad_group_id = headlines.ad_group_id
-                group by
-                    1,2
-            )
-
-            , descriptions_added as(
-                select
-                    latest.ad_id
-                    , latest.ad_group_id
-                    , string_agg(descriptions.description, " " order by description) as description
-                from
-                    latest
-                left join
-                    descriptions
-                on
-                    latest.ad_id = descriptions.ad_id
-                and
-                    latest.ad_group_id = descriptions.ad_group_id
-                group by
-                    1,2
+{% if active %}
+with
+    accounts as (
+        select
+            customer__id as account_id
+          , customer__descriptiveName as account_name
+        from
+            `{{dataset_id}}.stream_account`
+        qualify
+            rank() over (
+                partition by
+                    customer__id
                 order by
-                    latest.ad_id, latest.ad_group_id
-            )
-
-            , final_cte as(
-                select
-                    latest.ad_id
-                    , latest.ad_group_id
-                    , latest.path_1
-                    , latest.path_2
-                    , descriptions_added.description
-                    , headlines_added.headline
-                from
-                    latest
-                left join
-                    descriptions_added
-                on
-                    latest.ad_id = descriptions_added.ad_id
-                and
-                    latest.ad_group_id = descriptions_added.ad_group_id
-                left join
-                    headlines_added
-                on
-                    latest.ad_id = headlines_added.ad_id
-                and
-                    latest.ad_group_id = headlines_added.ad_group_id
-            )
-
-            , report as(
-                select
-                    source.date
-                    , source.ad_id
-                    , ads.name as ad_name
-                    , source.ad_group_id
-                    , source.campaign_id
-                    , split(regexp_replace(final_urls, r"\[|\]|https:\/\/|www\.|http:\/\/", ''), '/')[safe_ordinal(1)] as final_url
-                    , sum(safe_divide(source.cost_micros, {{ micro_denominator }})) as cost
-                    , sum(source.clicks) as clicks
-                    , sum(source.impressions) as impressions
-                    , sum(source.conversions) as conversions
-                    , sum(source.conversions_value) as conversions_value
-                from
-                    {{source_dataset_id}}.{{source_table_id}} as source
-                left join
-                    ads
-                on
-                    source.ad_id = ads.id
-                and
-                    source.ad_group_id = ads.ad_group_id
-                group by
-                    1,2,3,4,5,6
-            )
-
-            , pivots as(
-                select
-                    *
-                from
-                    (
-                        select
-                            date
-                            , ad_id
-                            , ad_group_id
-                            , campaign_id
-                            , all_conversions -- This is what we are going to sum in our pivot table
-                            , all_conversions_value  -- This is what we are going to sum in our pivot table
-                            , conversions  -- This is what we are going to sum in our pivot table
-                            , conversions_value  -- This is what we are going to sum in our pivot table
-                            , conversion_action_name
-                        from
-                            {{source_dataset_id}}.ad_performance_report_conversion_stats
-                    )
-                pivot(
-                    /* 
-                        We need to toggle these. For instance we may not always want all of these columns by
-                        default because it may be confusing for the user. Perhaps we only typically want 
-                        all_conversions and all_conversions_value
-                    */
-                    sum(all_conversions) as all_conversions
-                    , sum(all_conversions_value) as all_conversions_value
-                    , sum(conversions) as conversions
-                    , sum(conversions_value) as conversions_value
-
-                    {% if conversions.size >= 1 %}
-                        for conversion_action_name in (
-                        -- Need to create a loop here for conversion action names and their aliases
-                            {% for conversion in conversions %}
-                                {% if forloop.first %}
-                                    "{{conversion.event_name}}" {{ conversion.output_name }}
-                                {% else %}
-                                    , "{{conversion.event_name}}" {{ conversion.output_name }}
-                                {% endif %}
-                            {% endfor %}
-                        )
-                    {% else %}
-                        for conversion_action_name in (
-                            'event_name' as event_name
-                        )
-                    {% endif %}
-
-                )
-            )
-            /* 
-                This is caled API (case insensitive) because we are establishing what the user
-                of this package can and cannot reference from the fivetran table. Because the can add
-                anything that they want to the config we have to limit what they can access so that we can 
-                make sure that everything is always present from what they need.
-            */
-            , api as(
-                select
-                    report.date
-                    , report.ad_id
-                    , report.ad_name
-                    , report.ad_group_id
-                    , ad_groups.name as ad_group_name
-                    , sync_info.max_synced_at as last_synced_at
-                    , sync_info.max_data_date as last_data_date
-                    , report.campaign_id
-                    , campaigns.name as campaign_name
-                    , accounts.descriptive_name as account_name
-                    , accounts.id as account_id
-                    , campaigns.advertising_channel_type
-                    , report.clicks
-                    , report.cost
-                    , report.impressions
-                    , report.conversions
-                    , report.conversions_value
-                    , report.final_url
-                    , final_cte.path_1
-                    , final_cte.path_2
-                    , final_cte.description
-                    , final_cte.headline
-                    , (select string_agg(part, "/") from unnest([final_url, lower(path_1), lower(path_2)]) part) as full_display_url
-                    , campaigns.start_date as campaign_start_date
-                    , campaigns.end_date as campaign_end_date
-
-                    , trim(split(campaigns.name, '{{campaign_delimiter}}')[safe_ordinal(1)]) as campaign_pos_1
-                    , trim(split(campaigns.name, '{{campaign_delimiter}}')[safe_ordinal(2)]) as campaign_pos_2
-                    , trim(split(campaigns.name, '{{campaign_delimiter}}')[safe_ordinal(3)]) as campaign_pos_3
-                    , trim(split(campaigns.name, '{{campaign_delimiter}}')[safe_ordinal(4)]) as campaign_pos_4
-                    , trim(split(campaigns.name, '{{campaign_delimiter}}')[safe_ordinal(5)]) as campaign_pos_5
-
-
-                    , trim(split(ad_groups.name, '{{ad_group_delimiter}}')[safe_ordinal(1)]) as ad_group_pos_1
-                    , trim(split(ad_groups.name, '{{ad_group_delimiter}}')[safe_ordinal(2)]) as ad_group_pos_2
-                    , trim(split(ad_groups.name, '{{ad_group_delimiter}}')[safe_ordinal(3)]) as ad_group_pos_3
-                    , trim(split(ad_groups.name, '{{ad_group_delimiter}}')[safe_ordinal(4)]) as ad_group_pos_4
-                    , trim(split(ad_groups.name, '{{ad_group_delimiter}}')[safe_ordinal(5)]) as ad_group_pos_5
-                    {% for conversion in conversions %}
+                    _time_extracted desc
+            ) = 1
+            and row_number() over (
+                partition by
+                    customer__id
+                  , _time_extracted
+            ) = 1
+    )
+  , campaigns as (
+        select
+            customer__id as account_id
+          , campaign__id as campaign_id
+          , campaign__advertisingChannelType as advertising_channel_type
+          , campaign__name as campaign_name
+          , format_date('%Y-%m-%d', date(campaign__startDate)) as campaign_start_date
+          , format_date('%Y-%m-%d', date(campaign__endDate)) as campaign_end_date
+        from
+            `{{dataset_id}}.stream_campaign`
+        qualify
+            rank() over (
+                partition by
+                    campaign__id
+                  , customer__id
+                order by
+                    _time_extracted desc
+            ) = 1
+            and row_number() over (
+                partition by
+                    campaign__id
+                  , customer__id
+                  , _time_extracted
+            ) = 1
+    )
+  , ad_groups as (
+        select
+            customer__id as account_id
+          , campaign__id as campaign_id
+          , adGroup__id as ad_group_id
+          , adGroup__name as ad_group_name
+        from
+            `{{dataset_id}}.stream_adgroups`
+        qualify
+            rank() over (
+                partition by
+                    adGroup__id
+                  , campaign__id
+                  , customer__id
+                order by
+                    _time_extracted desc
+            ) = 1
+            and row_number() over (
+                partition by
+                    adGroup__id
+                  , campaign__id
+                  , customer__id
+                  , _time_extracted
+            ) = 1
+    )
+  , latest_ad_data as (
+        select
+            *
+        from
+            `{{dataset_id}}.stream_ad_report`
+        qualify
+            rank() over (
+                partition by
+                    segments__date
+                  , adGroupAd__ad__id
+                  , adGroup__id
+                  , campaign__id
+                  , customer__id
+                order by
+                    _time_extracted desc
+            ) = 1
+            and row_number() over (
+                partition by
+                    segments__date
+                  , adGroupAd__ad__id
+                  , adGroup__id
+                  , campaign__id
+                  , customer__id
+                  , _time_extracted
+            ) = 1
+    )
+  , report as (
+        select
+            segments__date as date
+          , customer__id as account_id
+          , campaign__id as campaign_id
+          , adGroup__id as ad_group_id
+          , sum(metrics__impressions) as _impressions
+          , sum(metrics__clicks) as _clicks
+          , sum(metrics__conversions) as _conversions
+          , sum(metrics__conversionsValue) as _conversions_value
+          , sum(metrics__costMicros / 1000000) as _cost
+          , sum(metrics__conversionsValue) as _revenue
+        from
+            -- `{{dataset_id}}.stream_ad_report`
+            latest_ad_data
+        group by
+            1
+          , 2
+          , 3
+          , 4
+    )
+  , latest_conversion_stats as (
+        select
+            *
+        from
+            `{{dataset_id}}.stream_ad_performance_report_conversion_stats`
+        qualify
+            rank() over (
+                partition by
+                    segments__date
+                  , segments__device
+                  , adGroupAd__ad__id
+                  , adGroup__id
+                  , campaign__id
+                  , customer__id
+                order by
+                    _time_extracted desc
+            ) = 1
+            and row_number() over (
+                partition by
+                    segments__date
+                  , segments__device
+                  , adGroupAd__ad__id
+                  , adGroup__id
+                  , campaign__id
+                  , customer__id
+                  , _time_extracted
+            ) = 1
+    )
+  , report_custom_conversions as (
+        select
+            segments__date as date
+          , segments__conversionActionName as conversion_action_name
+          , customer__id as account_id
+          , campaign__id as campaign_id
+          , adGroup__id as ad_group_id
+          , sum(metrics__allConversions) as all_conversions
+          , sum(metrics__allConversionsValue) as all_conversions_value
+        from
+            -- `{{dataset_id}}.stream_ad_performance_report_conversion_stats`
+            latest_conversion_stats
+        group by
+            1
+          , 2
+          , 3
+          , 4
+          , 5
+    )
+  , pivoted as (
+        select
+            *
+        from
+            report_custom_conversions pivot(
+                sum(all_conversions) as all_conversions
+              , sum(all_conversions_value) as all_conversion_value
+                for
+                    conversion_action_name in (
                         /* 
-                            We need to toggle these. For instance we may not always want all of these columns by
-                            default because it may be confusing for the user. Perhaps we only typically want 
-                            all_conversions and all_conversions_value
-                        */
-                        , pivots.conversions_{{conversion.output_name}}
-                        , pivots.conversions_value_{{conversion.output_name}}
-                        , pivots.all_conversions_{{conversion.output_name}}
-                        , pivots.all_conversions_value_{{conversion.output_name}}
-                    {% endfor %}
-                from
-                    report
-                left join
-                    pivots
-                on
-                    report.date = pivots.date
-                and
-                    report.ad_id = pivots.ad_id
-                and
-                    report.ad_group_id = pivots.ad_group_id
-                and
-                    report.campaign_id = pivots.campaign_id
-                left join
-                    campaigns
-                on
-                    report.campaign_id = campaigns.id
-                left join
-                    ad_groups
-                on
-                    report.ad_group_id = ad_groups.id
-                left join
-                    accounts
-                on
-                    campaigns.customer_id = accounts.id
-                left join 
-                    final_cte
-                on 
-                    report.ad_id = final_cte.ad_id
-                and
-                    report.ad_group_id = final_cte.ad_group_id
-                left join
-                    sync_info
-                on
-                    true
-            )
-
-            select
-                {% for dimension in dimensions %}
-                    {% unless forloop.first %}
-                        , 
-                    {% endunless %}
-                    CAST({{dimension.expression}} as {{dimension.type}}) as `{{dimension.name}}`
-                {% endfor %}
-                {% for metric in metrics %}
-                    , CAST({{metric.expression}} as {{metric.type}}) as `{{metric.name}}`
-                {% endfor %}
-            from
-                api
-                {% if number_of_accounts > 0 %}
-                    where account_id in(
-                        {% for id in account_id %}
-                            {% unless forloop.first %}
-                                , 
-                            {% endunless %}
-                            {{id}}
-                        {% endfor %}
+                        Custom Events Here:
+                         */
+                           'ASHS Leadform' as ashs_leadform
+                      , 'BSHA Leadform' as bsha_leadform
+                      , 'Calls from ads' as calls_from_ads
+                      , 'Clicks to call' as clicks_to_call
+                      , 'EKG Lead Form' as ekg_lead_form
+                      , 'HubSpot - Lead' as hubspot_lead
+                      , 'HubSpot - Opportunity' as hubspot_opportunity
+                      , 'Lead form - Submit' as lead_form_submit
+                      , 'Local actions - Directions' as local_actions_directions
+                      , 'Local actions - Menu views' as local_actions_menu_views
+                      , 'Local actions - Other engagements' as local_actions_other_engagements
+                      , 'Local actions - Website visits' as local_actions_website_visits
+                      , 'Phone Call' as phone_call
+                      , 'Program Request (Clean Data)' as program_request_clean_data_
+                      , 'Qualified Lead Hubspot' as qualified_lead_hubspot
+                      , 'SEM Thank You - ASN - RMI' as sem_thank_you_asn_rmi
+                      , 'SEM Thank You - IONM - RMI' as sem_thank_you_ionm_rmi
+                      , 'SEM Thank You - NDT - RMI' as sem_thank_you_ndt_rmi
+                      , 'SEM Thank You - Quincy' as sem_thank_you_quincy
+                      , 'SEM Thank You - RN-BSN - RMI' as sem_thank_you_rn_bsn_rmi
+                      , 'Store visits' as store_visits
+                      , 'TV - Form Submission' as tv_form_submission
+                      , 'Thank You - Admissions General Request' as thank_you_admissions_general_request
+                      , 'Thank You - CDI' as thank_you_cdi
+                      , 'Thank You - Contact Us' as thank_you_contact_us
                     )
-                {% endif %}
-                {% if regexp_filters != blank and regexp_filters != false %}
-                    {% if number_of_accounts > 0 %}
-                        AND
-                    {% else %}
-                        WHERE
-                    {% endif %}
-                    {% for filter in regexp_filters %}
-                        {% unless forloop.first %}
-                            AND 
-                        {% endunless %}
-                        REGEXP_CONTAINS({{filter.dimension}}, r"{{filter.expression}}") = {{filter.result}}
-                    {% endfor %}
-                {% endif %}
-            group by
-                {% for dimension in dimensions %}
-                    {% unless forloop.first %}
-                        , 
-                    {% endunless %}
-                    {{forloop.index}}
-                {% endfor %}
-        )
-    {% endif %}
-    ;
-
-    {%- assign external_project_active = vars.external_project.active -%}
-    {%- assign external_project_id = vars.external_project.project_id -%}
-    {%- assign external_project_location = vars.external_project.schema_settings.location -%}
-    {%- assign external_project_dataset_description = vars.external_project.schema_settings.description -%}
-    {%- assign external_project_dataset_friendly_name = vars.external_project.schema_settings.friendly_name -%}
-
-    {%- if external_project_active -%}
-        CREATE SCHEMA IF NOT EXISTS `{{external_project_id}}`.`{{dataset_id}}`
-        options(
-            location='{{external_project_location}}'
-            , friendly_name="{{external_project_dataset_friendly_name}}"
-            , description="{{external_project_dataset_description}}"
-        );
-
-        CREATE OR REPLACE TABLE 
-            `{{external_project_id}}`.`{{dataset_id}}`.`{{table_id}}` (
-            {% for dimension in dimensions %}
-                {% unless forloop.first %}
-                    , 
-                {% endunless %}
-                `{{dimension.name}}` {{dimension.type}} OPTIONS (description = '[db_field_name = {{dimension.name}}]') 
-            {% endfor %}
-            {% for metric in metrics %}
-                , `{{metric.name}}` {{metric.type}}  OPTIONS (description = '[db_field_name = {{metric.name}}]') 
-            {% endfor %}
             )
+    )
+  , api as (
+        select
+            report.*
+          , campaigns.campaign_name
+          , campaigns.advertising_channel_type
+          , campaign_start_date
+          , campaign_end_date
+          , accounts.account_name
+          , ad_groups.ad_group_name
+          , pivoted.* except (date, campaign_id, account_id, ad_group_id)
+        from
+            report
+            left join pivoted on report.date = pivoted.date
+            and report.campaign_id = pivoted.campaign_id
+            left join campaigns on report.campaign_id = campaigns.campaign_id
+            left join accounts on report.account_id = accounts.account_id
+            left join ad_groups on report.ad_group_id = ad_groups.ad_group_id
+    )
+select
+    *
+from
+    api
+where
+    account_id in (
+        {% for id in account_ids %}
+        {% unless forloop.first %}
 
-        {% if active and table_active %}
-            AS (
-                select * from `{{dataset_id}}`.`{{table_id}}`
-            )
-        {% endif %}
-        ;
-    {%- endif -%}
-
-{% else %}
-  
-    CREATE OR REPLACE TABLE
-        `{{dataset_id}}`.`{{table_id}}` (
-        {% for dimension in dimensions %}
-            {% unless forloop.first %}
-                ,
-            {% endunless %}
-            `{{dimension.name}}` {{dimension.type}} OPTIONS (description = '[db_field_name = {{dimension.name}}]')
+      , {% endunless %} '{{id}}'
         {% endfor %}
-        {% for metric in metrics %}
-            , `{{metric.name}}` {{metric.type}}  OPTIONS (description = '[db_field_name = {{metric.name}}]')
-        {% endfor %}
-        )
-    {% if active and table_active %}
-        AS(
-            with
-
-            sync_info as (
-                select
-                  max(segments_date) as max_synced_at
-                  , max(segments_date) as max_data_date
-                from {{source_dataset_id}}.{{source_table_id}}
-            )
-
-            , campaigns as(
-                select
-                    *
-                from
-                    {{source_dataset_id}}.campaign
-                qualify rank() over(partition by campaign_id order by segments_date desc) = 1
-                and row_number() over(partition by campaign_id, segments_date) = 1
-            )
-
-            , accounts as(
-                select
-                    *
-                from
-                    {{source_dataset_id}}.account
-                qualify rank() over(partition by customer_id order by segments_date desc) = 1
-                and row_number() over(partition by customer_id, segments_date) = 1
-            )
-
-            , ad_groups as(
-                select
-                    *
-                from
-                    {{source_dataset_id}}.ad_group
-                qualify rank() over(partition by ad_group_id order by segments_date desc) = 1
-                and row_number() over(partition by ad_group_id, segments_date) = 1
-            )
-
-            , ads as(
-                select
-                    *
-                from
-                    {{source_dataset_id}}.ad
-                qualify rank() over(partition by ad_group_ad_ad_id, ad_group_id order by segments_date desc) = 1
-                and row_number() over(partition by ad_group_ad_ad_id, ad_group_id, segments_date) = 1
-            )
-
-            , latest as(
-                select
-                    ad_group_ad_ad_id as ad_id
-                    , ad_group_ad_ad_responsive_search_ad_path1 as path_1
-                    , ad_group_ad_ad_responsive_search_ad_path2 as path_2
-                    , *
-                from
-                {{source_dataset_id}}.responsive_search_ad
-                qualify rank() over(partition by ad_group_ad_ad_id, ad_group_id order by segments_date desc) = 1
-                and row_number() over(partition by ad_id, ad_group_id, segments_date) = 1
-            )
-
-            , headlines as(
-                select
-                    ad_id
-                    , ad_group_id
-                    , json_value(element, "$.text") as headline
-                    , ad_group_ad_ad_responsive_search_ad_headlines as headlines
-                from
-                    latest
-                    , unnest(json_extract_array(ad_group_ad_ad_responsive_search_ad_headlines)) as element
-                group by
-                    1,2,3,4
-                qualify row_number() over(partition by ad_group_id, ad_id) <= 3
-            )
-
-            , descriptions as(
-                select
-                    ad_id
-                    , ad_group_id
-                    , json_value(element, "$.text") as description
-                    , ad_group_ad_ad_responsive_search_ad_descriptions as descriptions
-                from
-                    latest
-                    , unnest(json_extract_array(ad_group_ad_ad_responsive_search_ad_descriptions)) as element
-                group by
-                    1,2,3,4
-                qualify row_number() over(partition by ad_group_id, ad_id) <= 2
-            )
-
-            , headlines_added as(
-                select
-                    latest.ad_id
-                    , latest.ad_group_id
-                    , string_agg(headlines.headline, " | " order by headline) as headline
-                from
-                    latest
-                left join
-                    headlines
-                on
-                    latest.ad_id = headlines.ad_id
-                and
-                    latest.ad_group_id = headlines.ad_group_id
-                group by
-                    1,2
-            )
-
-            , descriptions_added as(
-                select
-                    latest.ad_id
-                    , latest.ad_group_id
-                    , string_agg(descriptions.description, " " order by description) as description
-                from
-                    latest
-                left join
-                    descriptions
-                on
-                    latest.ad_id = descriptions.ad_id
-                and
-                    latest.ad_group_id = descriptions.ad_group_id
-                group by
-                    1,2
-                order by
-                    latest.ad_id, latest.ad_group_id
-            )
-
-            , final_cte as(
-                select
-                    latest.ad_id
-                    , latest.ad_group_id
-                    , latest.path_1
-                    , latest.path_2
-                    , descriptions_added.description
-                    , headlines_added.headline
-                from
-                    latest
-                left join
-                    descriptions_added
-                on
-                    latest.ad_id = descriptions_added.ad_id
-                and
-                    latest.ad_group_id = descriptions_added.ad_group_id
-                left join
-                    headlines_added
-                on
-                    latest.ad_id = headlines_added.ad_id
-                and
-                    latest.ad_group_id = headlines_added.ad_group_id
-            )
-
-            , report as(
-                select
-                    source.segments_date
-                    , source.ad_group_ad_ad_id
-                    , ads.ad_group_ad_ad_name as ad_name
-                    , source.ad_group_id
-                    , source.campaign_id
-                    , split(regexp_replace(ads.ad_group_ad_ad_final_urls[safe_ordinal(1)], r"\[|\]|https:\/\/|www\.|http:\/\/", ''), '/')[safe_ordinal(1)] as final_url
-                    , sum(safe_divide(source.metrics_cost_micros, {{ micro_denominator }})) as metrics_cost
-                    , sum(source.metrics_clicks) as metrics_clicks
-                    , sum(source.metrics_impressions) as metrics_impressions
-                    , sum(source.metrics_conversions) as metrics_conversions
-                    , sum(source.metrics_conversions_value) as metrics_conversions_value
-                from
-                    {{source_dataset_id}}.{{source_table_id}} as source
-                left join
-                    ads
-                on
-                    source.ad_group_ad_ad_id = ads.ad_group_ad_ad_id
-                and
-                    source.ad_group_id = ads.ad_group_id
-                group by
-                    1,2,3,4,5,6
-            )
-
-            , pivots as(
-                select
-                    *
-                from
-                    (
-                        select
-                            segments_date
-                            , ad_group_ad_ad_id
-                            , ad_group_id
-                            , campaign_id
-                            , metrics_all_conversions -- This is what we are going to sum in our pivot table
-                            , metrics_all_conversions_value  -- This is what we are going to sum in our pivot table
-                            , metrics_conversions  -- This is what we are going to sum in our pivot table
-                            , metrics_conversions_value  -- This is what we are going to sum in our pivot table
-                            , segments_conversion_action_name
-                        from
-                            {{source_dataset_id}}.ad_performance_report_conversion_stats
-                    )
-                pivot(
-                    /*
-                        We need to toggle these. For instance we may not always want all of these columns by
-                        default because it may be confusing for the user. Perhaps we only typically want
-                        all_conversions and all_conversions_value
-                    */
-                    sum(metrics_all_conversions) as metrics_all_conversions
-                    , sum(metrics_all_conversions_value) as metrics_all_conversions_value
-                    , sum(metrics_conversions) as metrics_conversions
-                    , sum(metrics_conversions_value) as metrics_conversions_value
-
-                    {% if conversions.size >= 1 %}
-                        for segments_conversion_action_name in (
-                        -- Need to create a loop here for conversion action names and their aliases
-                            {% for conversion in conversions %}
-                                {% if forloop.first %}
-                                    "{{conversion.event_name}}" {{ conversion.output_name }}
-                                {% else %}
-                                    , "{{conversion.event_name}}" {{ conversion.output_name }}
-                                {% endif %}
-                            {% endfor %}
-                        )
-                    {% else %}
-                        for segments_conversion_action_name in (
-                            'event_name' as event_name
-                        )
-                    {% endif %}
-
-                )
-            )
-            /*
-                This is caled API (case insensitive) because we are establishing what the user
-                of this package can and cannot reference from the fivetran table. Because the can add
-                anything that they want to the config we have to limit what they can access so that we can
-                make sure that everything is always present from what they need.
-            */
-            , api as(
-                select
-                    report.segments_date as date
-                    , report.ad_group_ad_ad_id as ad_id
-                    , report.ad_name
-                    , report.ad_group_id
-                    , ad_groups.ad_group_name as ad_group_name
-                    , sync_info.max_synced_at as last_synced_at
-                    , sync_info.max_data_date as last_data_date
-                    , report.campaign_id
-                    , campaigns.campaign_name as campaign_name
-                    , accounts.customer_descriptive_name as account_name
-                    , accounts.customer_id as account_id
-                    , campaigns.campaign_advertising_channel_type as advertising_channel_type
-                    , report.metrics_clicks as clicks
-                    , report.metrics_cost as cost
-                    , report.metrics_impressions as impressions
-                    , report.metrics_conversions as conversions
-                    , report.metrics_conversions_value as conversions_value
-                    , report.final_url
-                    , final_cte.path_1
-                    , final_cte.path_2
-                    , final_cte.description
-                    , final_cte.headline
-                    , (select string_agg(part, "/") from unnest([final_url, lower(path_1), lower(path_2)]) part) as full_display_url
-                    , campaigns.campaign_start_date
-                    , campaigns.campaign_end_date
-
-                    , trim(split(campaigns.campaign_name, '{{campaign_delimiter}}')[safe_ordinal(1)]) as campaign_pos_1
-                    , trim(split(campaigns.campaign_name, '{{campaign_delimiter}}')[safe_ordinal(2)]) as campaign_pos_2
-                    , trim(split(campaigns.campaign_name, '{{campaign_delimiter}}')[safe_ordinal(3)]) as campaign_pos_3
-                    , trim(split(campaigns.campaign_name, '{{campaign_delimiter}}')[safe_ordinal(4)]) as campaign_pos_4
-                    , trim(split(campaigns.campaign_name, '{{campaign_delimiter}}')[safe_ordinal(5)]) as campaign_pos_5
-
-
-                    , trim(split(ad_groups.ad_group_name, '{{ad_group_delimiter}}')[safe_ordinal(1)]) as ad_group_pos_1
-                    , trim(split(ad_groups.ad_group_name, '{{ad_group_delimiter}}')[safe_ordinal(2)]) as ad_group_pos_2
-                    , trim(split(ad_groups.ad_group_name, '{{ad_group_delimiter}}')[safe_ordinal(3)]) as ad_group_pos_3
-                    , trim(split(ad_groups.ad_group_name, '{{ad_group_delimiter}}')[safe_ordinal(4)]) as ad_group_pos_4
-                    , trim(split(ad_groups.ad_group_name, '{{ad_group_delimiter}}')[safe_ordinal(5)]) as ad_group_pos_5
-                    {% for conversion in conversions %}
-                        /*
-                            We need to toggle these. For instance we may not always want all of these columns by
-                            default because it may be confusing for the user. Perhaps we only typically want
-                            all_conversions and all_conversions_value
-                        */
-                        , pivots.metrics_conversions_{{conversion.output_name}}
-                        , pivots.metrics_conversions_value_{{conversion.output_name}}
-                        , pivots.metrics_all_conversions_{{conversion.output_name}}
-                        , pivots.metrics_all_conversions_value_{{conversion.output_name}}
-                    {% endfor %}
-                from
-                    report
-                left join
-                    pivots
-                on
-                    report.segments_date = pivots.segments_date
-                and
-                    report.ad_group_ad_ad_id = pivots.ad_group_ad_ad_id
-                and
-                    report.ad_group_id = pivots.ad_group_id
-                and
-                    report.campaign_id = pivots.campaign_id
-                left join
-                    campaigns
-                on
-                    report.campaign_id = campaigns.campaign_id
-                left join
-                    ad_groups
-                on
-                    report.ad_group_id = ad_groups.ad_group_id
-                left join
-                    accounts
-                on
-                    campaigns.customer_id = accounts.customer_id
-                left join
-                    final_cte
-                on
-                    report.ad_group_ad_ad_id = final_cte.ad_id
-                and
-                    report.ad_group_id = final_cte.ad_group_id
-                left join
-                    sync_info
-                on
-                    true
-            )
-
-            select
-                {% for dimension in dimensions %}
-                    {% unless forloop.first %}
-                        ,
-                    {% endunless %}
-                    CAST({{dimension.expression}} as {{dimension.type}}) as `{{dimension.name}}`
-                {% endfor %}
-                {% for metric in metrics %}
-                    , CAST({{metric.expression}} as {{metric.type}}) as `{{metric.name}}`
-                {% endfor %}
-            from
-                api
-                {% if number_of_accounts > 0 %}
-                    where account_id in(
-                        {% for id in account_id %}
-                            {% unless forloop.first %}
-                                ,
-                            {% endunless %}
-                            {{id}}
-                        {% endfor %}
-                    )
-                {% endif %}
-                {% if regexp_filters != blank and regexp_filters != false %}
-                    {% if number_of_accounts > 0 %}
-                        AND
-                    {% else %}
-                        WHERE
-                    {% endif %}
-                    {% for filter in regexp_filters %}
-                        {% unless forloop.first %}
-                            AND
-                        {% endunless %}
-                        REGEXP_CONTAINS({{filter.dimension}}, r"{{filter.expression}}") = {{filter.result}}
-                    {% endfor %}
-                {% endif %}
-            group by
-                {% for dimension in dimensions %}
-                    {% unless forloop.first %}
-                        ,
-                    {% endunless %}
-                    {{forloop.index}}
-                {% endfor %}
-        )
+    )
+    {% else %}
+select
+    safe_cast(null as string) as account_id
+  , safe_cast(null as string) as account_name
+  , safe_cast(null as string) as ad_group_id
+  , safe_cast(null as string) as ad_group_name
+  , safe_cast(null as string) as advertising_channel_type
+  , safe_cast(null as date) as campaign_start_date
+  , safe_cast(null as date) as campaign_end_date
+  , safe_cast(null as float64) as all_conversions_fake_event
+  , safe_cast(null as float64) as all_conversion_value_fake_event
+  , safe_cast(null as string) as campaign_id
+  , safe_cast(null as string) as campaign_name
+  , safe_cast(null as int64) as _clicks
+  , safe_cast(null as int64) as _conversions
+  , safe_cast(null as int64) as _conversions_value
+  , safe_cast(null as int64) as _cost
+  , safe_cast(null as date) as date
+  , safe_cast(null as int64) as _impressions
+  , safe_cast(null as int64) as _revenue
+from
+    unnest ([])
     {% endif %}
-    ;
-
-    {%- assign external_project_active = vars.external_project.active -%}
-    {%- assign external_project_id = vars.external_project.project_id -%}
-    {%- assign external_project_location = vars.external_project.schema_settings.location -%}
-    {%- assign external_project_dataset_description = vars.external_project.schema_settings.description -%}
-    {%- assign external_project_dataset_friendly_name = vars.external_project.schema_settings.friendly_name -%}
-
-    {%- if external_project_active -%}
-        CREATE SCHEMA IF NOT EXISTS `{{external_project_id}}`.`{{dataset_id}}`
-        options(
-            location='{{external_project_location}}'
-            , friendly_name="{{external_project_dataset_friendly_name}}"
-            , description="{{external_project_dataset_description}}"
-        );
-
-        CREATE OR REPLACE TABLE
-            `{{external_project_id}}`.`{{dataset_id}}`.`{{table_id}}` (
-            {% for dimension in dimensions %}
-                {% unless forloop.first %}
-                    ,
-                {% endunless %}
-                `{{dimension.name}}` {{dimension.type}} OPTIONS (description = '[db_field_name = {{dimension.name}}]')
-            {% endfor %}
-            {% for metric in metrics %}
-                , `{{metric.name}}` {{metric.type}}  OPTIONS (description = '[db_field_name = {{metric.name}}]')
-            {% endfor %}
-            )
-
-        {% if active and table_active %}
-            AS (
-                select * from `{{dataset_id}}`.`{{table_id}}`
-            )
-        {% endif %}
-        ;
-    {%- endif -%}
-{% endif %}
-
-
